@@ -29,18 +29,7 @@ import java.net.UnknownHostException;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Collection;
-import java.util.Collections;
-import java.util.Date;
-import java.util.HashSet;
-import java.util.LinkedHashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
-import java.util.TimerTask;
-import java.util.UUID;
+import java.util.*;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -50,8 +39,6 @@ import com.google.common.util.concurrent.SimpleTimeLimiter;
 import com.google.common.util.concurrent.ThreadFactoryBuilder;
 import org.apache.logging.log4j.LogManager;
 import org.dom4j.Document;
-import org.dom4j.DocumentException;
-import org.dom4j.io.SAXReader;
 import org.jivesoftware.database.DbConnectionManager;
 import org.jivesoftware.database.JNDIDataSourceProvider;
 import org.jivesoftware.openfire.admin.AdminManager;
@@ -130,17 +117,11 @@ import org.jivesoftware.openfire.update.UpdateManager;
 import org.jivesoftware.openfire.user.User;
 import org.jivesoftware.openfire.user.UserManager;
 import org.jivesoftware.openfire.vcard.VCardManager;
-import org.jivesoftware.util.InitializationException;
-import org.jivesoftware.util.JiveGlobals;
-import org.jivesoftware.util.LocaleUtils;
-import org.jivesoftware.util.Log;
-import org.jivesoftware.util.SystemProperty;
-import org.jivesoftware.util.TaskEngine;
+import org.jivesoftware.util.*;
 import org.jivesoftware.openfire.archive.ArchiveManager;
 import org.jivesoftware.util.cache.CacheFactory;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.xml.sax.SAXException;
 import org.xmpp.packet.JID;
 import org.xmpp.packet.Message;
 
@@ -186,6 +167,7 @@ public class XMPPServer {
     private NodeID nodeID;
     private static final NodeID DEFAULT_NODE_ID = NodeID.getInstance( UUID.randomUUID().toString().getBytes() );
 
+    private Timer terminatorTimer;
     public static final String EXIT = "exit";
     private final static Set<String> XML_ONLY_PROPERTIES;
     static {
@@ -422,7 +404,8 @@ public class XMPPServer {
         if (isStandAlone()) {
             logger.info("Registering shutdown hook (standalone mode)");
             Runtime.getRuntime().addShutdownHook(new ShutdownHookThread());
-            TaskEngine.getInstance().schedule(new Terminator(), 1000, 1000);
+            terminatorTimer = new Timer(); // Not using TaskEngine here, as that requires configuration to be available, which it is not yet.
+            terminatorTimer.schedule(new Terminator(), 1000, 1000);
         }
 
         loader = Thread.currentThread().getContextClassLoader();
@@ -1143,8 +1126,7 @@ public class XMPPServer {
         if (openfireHome == null) {
             try (InputStream in = getClass().getResourceAsStream("/openfire_init.xml")) {
                 if (in != null) {
-                    Document doc = readDocument(in);
-                    String path = doc.getRootElement().getText();
+                    String path = SAXReaderUtil.readRootElement(in).getText();
                     try {
                         if (path != null) {
                             openfireHome = verifyHome(path, jiveConfigName);
@@ -1158,6 +1140,9 @@ public class XMPPServer {
             catch (Exception e) {
                 System.err.println("Error loading openfire_init.xml to find home.");
                 e.printStackTrace();
+                if (e instanceof InterruptedException) {
+                    Thread.currentThread().interrupt();
+                }
             }
         }
 
@@ -1171,14 +1156,6 @@ public class XMPPServer {
             // Set the name of the config file
             JiveGlobals.setConfigName(jiveConfigName);
         }
-    }
-
-    private Document readDocument(InputStream in) throws SAXException, DocumentException {
-        SAXReader reader = new SAXReader();
-        reader.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true);
-        reader.setFeature("http://xml.org/sax/features/external-general-entities", false);
-        reader.setFeature("http://xml.org/sax/features/external-parameter-entities", false);
-        return reader.read(in);
     }
 
     /**
@@ -1255,6 +1232,11 @@ public class XMPPServer {
      */
     private void shutdownServer() {
         shuttingDown = true;
+
+        if (terminatorTimer != null) {
+            terminatorTimer.cancel();
+        }
+
         ClusterManager.shutdown();
         // Notify server listeners that the server is about to be stopped
         for (XMPPServerListener listener : listeners) {

@@ -16,27 +16,26 @@
 
 package org.jivesoftware.openfire.roster;
 
-import java.sql.Connection;
-import java.sql.PreparedStatement;
-import java.sql.ResultSet;
-import java.sql.SQLException;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.Iterator;
-import java.util.LinkedList;
-import java.util.List;
-import java.util.Map;
-
+import org.dom4j.Element;
 import org.jivesoftware.database.DbConnectionManager;
 import org.jivesoftware.database.SequenceManager;
 import org.jivesoftware.openfire.user.UserAlreadyExistsException;
 import org.jivesoftware.util.JiveConstants;
 import org.jivesoftware.util.LocaleUtils;
+import org.jivesoftware.util.SAXReaderUtil;
 import org.jivesoftware.util.cache.Cache;
 import org.jivesoftware.util.cache.CacheFactory;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.xmpp.packet.JID;
+import org.xmpp.packet.Presence;
+
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.util.*;
+import java.util.concurrent.ExecutionException;
 
 /**
  * Defines the provider methods required for creating, reading, updating and deleting roster
@@ -55,10 +54,10 @@ public class DefaultRosterItemProvider implements RosterItemProvider {
     private static final Logger Log = LoggerFactory.getLogger(DefaultRosterItemProvider.class);
 
     private static final String CREATE_ROSTER_ITEM =
-            "INSERT INTO ofRoster (username, rosterID, jid, sub, ask, recv, nick) " +
-            "VALUES (?, ?, ?, ?, ?, ?, ?)";
+            "INSERT INTO ofRoster (username, rosterID, jid, sub, ask, recv, nick, stanza) " +
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
     private static final String UPDATE_ROSTER_ITEM =
-            "UPDATE ofRoster SET sub=?, ask=?, recv=?, nick=? WHERE rosterID=?";
+            "UPDATE ofRoster SET sub=?, ask=?, recv=?, nick=?, stanza=? WHERE rosterID=?";
     private static final String DELETE_ROSTER_ITEM_GROUPS =
             "DELETE FROM ofRosterGroups WHERE rosterID=?";
     private static final String CREATE_ROSTER_ITEM_GROUPS =
@@ -70,7 +69,7 @@ public class DefaultRosterItemProvider implements RosterItemProvider {
     private static final String COUNT_ROSTER_ITEMS =
             "SELECT COUNT(rosterID) FROM ofRoster WHERE username=?";
      private static final String LOAD_ROSTER =
-             "SELECT jid, rosterID, sub, ask, recv, nick FROM ofRoster WHERE username=?";
+             "SELECT jid, rosterID, sub, ask, recv, nick, stanza FROM ofRoster WHERE username=?";
     private static final String LOAD_ROSTER_ITEM_GROUPS =
              "SELECT ofRosterGroups.rosterID,groupName FROM ofRosterGroups " +
              "INNER JOIN ofRoster ON ofRosterGroups.rosterID = ofRoster.rosterID " +
@@ -100,6 +99,7 @@ public class DefaultRosterItemProvider implements RosterItemProvider {
             pstmt.setInt(5, item.getAskStatus().getValue());
             pstmt.setInt(6, item.getRecvStatus().getValue());
             pstmt.setString(7, item.getNickname());
+            pstmt.setString(8, item.getStoredSubscribeStanza() == null ? null : item.getStoredSubscribeStanza().toXML());
             pstmt.executeUpdate();
 
             item.setID(rosterID);
@@ -133,7 +133,8 @@ public class DefaultRosterItemProvider implements RosterItemProvider {
             pstmt.setInt(2, item.getAskStatus().getValue());
             pstmt.setInt(3, item.getRecvStatus().getValue());
             pstmt.setString(4, item.getNickname());
-            pstmt.setLong(5, rosterID);
+            pstmt.setString(5, item.getStoredSubscribeStanza() == null ? null : item.getStoredSubscribeStanza().toXML());
+            pstmt.setLong(6, rosterID);
             pstmt.executeUpdate();
             // Close now the statement (do not wait to be GC'ed)
             DbConnectionManager.fastcloseStmt(pstmt);
@@ -263,6 +264,12 @@ public class DefaultRosterItemProvider implements RosterItemProvider {
             rs = pstmt.executeQuery();
             while (rs.next()) {
                 // Create a new RosterItem (ie. user contact) from the stored information
+                // First parse out the presence, if it's there.
+                Presence presence = null;
+                if (rs.getString(7) != null) {
+                    Element root = SAXReaderUtil.readRootElement(rs.getString(7));
+                    presence = new Presence(root);
+                }
                 RosterItem item = new RosterItem(rs.getLong(2),
                         new JID(rs.getString(1)),
                         RosterItem.SubType.getTypeFromInt(rs.getInt(3)),
@@ -270,6 +277,9 @@ public class DefaultRosterItemProvider implements RosterItemProvider {
                         RosterItem.RecvType.getTypeFromInt(rs.getInt(5)),
                         rs.getString(6),
                         null);
+                if (presence != null) {
+                    item.setStoredSubscribeStanza(presence);
+                }
                 // Add the loaded RosterItem (ie. user contact) to the result
                 itemList.add(item);
                 itemsByID.put(item.getID(), item);
@@ -294,8 +304,11 @@ public class DefaultRosterItemProvider implements RosterItemProvider {
 
             rosterItemCache.put( username, itemList );
         }
-        catch (SQLException e) {
+        catch (SQLException | ExecutionException e) {
             Log.error(LocaleUtils.getLocalizedString("admin.error"), e);
+        }
+        catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
         }
         finally {
             DbConnectionManager.closeConnection(rs, pstmt, con);

@@ -151,12 +151,12 @@ public class PresenceSubscribeHandler extends BasicModule implements ChannelHand
             try {
                 Roster senderRoster = getRoster(senderJID);
                 if (senderRoster != null) {
-                    manageSub(recipientJID, true, type, senderRoster);
+                    manageSub(recipientJID, true, presence, senderRoster);
                 }
                 Roster recipientRoster = getRoster(recipientJID);
                 boolean recipientSubChanged = false;
                 if (recipientRoster != null) {
-                    recipientSubChanged = manageSub(senderJID, false, type, recipientRoster);
+                    recipientSubChanged = manageSub(senderJID, false, presence, recipientRoster);
                 }
 
                 // Do not forward the packet to the recipient if the presence is of type subscribed
@@ -268,17 +268,18 @@ public class PresenceSubscribeHandler extends BasicModule implements ChannelHand
      *
      * @param target    The roster target's jid (the item's jid to be changed)
      * @param isSending True if the request is being sent by the owner
-     * @param type      The subscription change type (subscribe, unsubscribe, etc.)
+     * @param presence      The subscription stanza
      * @param roster    The Roster that is updated.
      * @return {@code true} if the subscription state has changed.
      */
-    private boolean manageSub(JID target, boolean isSending, Presence.Type type, Roster roster)
-            throws UserAlreadyExistsException, SharedGroupException
+    private boolean manageSub(JID target, boolean isSending, Presence presence, Roster roster)
+            throws UserAlreadyExistsException, SharedGroupException, IllegalArgumentException
     {
         RosterItem item = null;
         RosterItem.AskType oldAsk;
         RosterItem.SubType oldSub = null;
         RosterItem.RecvType oldRecv;
+        Presence.Type type = presence.getType();
         boolean newItem = false;
         try {
             if (roster.isRosterItem(target)) {
@@ -292,9 +293,19 @@ public class PresenceSubscribeHandler extends BasicModule implements ChannelHand
                     // subscription approval from an unknown user
                     return false;
                 }
+                if (Presence.Type.subscribe != type) {
+                    throw new IllegalArgumentException("manageSub asked to manage non-subscription presence");
+                }
                 item = roster.createRosterItem(target, false, true);
                 newItem = true;
             }
+
+            if (Presence.Type.subscribe == type && !isSending) {
+                // For inbound <presence type='subscribe'/>, we should update the stored stanza here.
+                item.setStoredSubscribeStanza(presence);
+                RosterManager.getRosterItemProvider().updateItem(roster.getUsername(), item);
+            }
+
             // Get a snapshot of the item state
             oldAsk = item.getAskStatus();
             oldSub = item.getSubStatus();
@@ -302,8 +313,11 @@ public class PresenceSubscribeHandler extends BasicModule implements ChannelHand
             // Update the item state based in the received presence type
             updateState(item, type, isSending);
             // Update the roster IF the item state has changed
-            if (oldAsk != item.getAskStatus() || oldSub != item.getSubStatus() ||
-                    oldRecv != item.getRecvStatus()) {
+            if (oldAsk != item.getAskStatus() || oldSub != item.getSubStatus() || oldRecv != item.getRecvStatus()) {
+                if (oldRecv == RosterItem.RECV_SUBSCRIBE && item.getRecvStatus() != RosterItem.RECV_SUBSCRIBE) {
+                    // No longer asking for a subscription. Clean up the original subscription request stanza.
+                    item.setStoredSubscribeStanza(null);
+                }
                 roster.updateRosterItem(item);
             }
             else if (newItem) {

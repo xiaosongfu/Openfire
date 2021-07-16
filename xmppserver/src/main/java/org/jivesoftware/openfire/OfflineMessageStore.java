@@ -16,11 +16,9 @@
 
 package org.jivesoftware.openfire;
 
-import org.dom4j.DocumentException;
 import org.dom4j.Element;
 import org.dom4j.Namespace;
 import org.dom4j.QName;
-import org.dom4j.io.SAXReader;
 import org.jivesoftware.database.DbConnectionManager;
 import org.jivesoftware.database.SequenceManager;
 import org.jivesoftware.openfire.cluster.ClusterManager;
@@ -29,10 +27,7 @@ import org.jivesoftware.openfire.event.UserEventDispatcher;
 import org.jivesoftware.openfire.event.UserEventListener;
 import org.jivesoftware.openfire.user.User;
 import org.jivesoftware.openfire.user.UserManager;
-import org.jivesoftware.util.JiveConstants;
-import org.jivesoftware.util.LocaleUtils;
-import org.jivesoftware.util.StringUtils;
-import org.jivesoftware.util.XMPPDateTimeFormat;
+import org.jivesoftware.util.*;
 import org.jivesoftware.util.cache.Cache;
 import org.jivesoftware.util.cache.CacheFactory;
 import org.slf4j.Logger;
@@ -40,7 +35,6 @@ import org.slf4j.LoggerFactory;
 import org.xmpp.packet.JID;
 import org.xmpp.packet.Message;
 
-import java.io.StringReader;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
@@ -49,12 +43,9 @@ import java.time.Duration;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.*;
-import java.util.concurrent.BlockingQueue;
-import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ExecutionException;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
-
-import org.jivesoftware.util.SystemProperty;
 
 /**
  * Represents the user's offline message storage. A message store holds messages that were
@@ -90,8 +81,6 @@ public class OfflineMessageStore extends BasicModule implements UserEventListene
         "DELETE FROM ofOffline WHERE creationDate < ?";
     private static final String SELECT_SIZE_OFFLINE_ALL_USERS =
         "SELECT SUM(messageSize),username FROM ofOffline GROUP BY username";
-
-    private static final int POOL_SIZE = 10;
 
     private final Cache<String, Integer> sizeCache;
 
@@ -137,11 +126,6 @@ public class OfflineMessageStore extends BasicModule implements UserEventListene
     }
 
     /**
-     * Pool of SAX Readers. SAXReader is not thread safe so we need to have a pool of readers.
-     */
-    private BlockingQueue<SAXReader> xmlReaders = new LinkedBlockingQueue<>(POOL_SIZE);
-
-    /**
      * Constructs a new offline message store.
      */
     public OfflineMessageStore() {
@@ -167,26 +151,26 @@ public class OfflineMessageStore extends BasicModule implements UserEventListene
      *
      * Note that certain messages are ignored by this implementation, for example, messages that are carbon copies,
      * have 'no-store' hints, or for which the intended recipient is not a local user. When a message is discarded for
-     * reasons like these, this method will return 'false'.
+     * reasons like these, this method will return 'null'.
      *
      * @param message the message to store.
-     * @return true when data was stored, otherwise false.
+     * @return OfflineMessage when data was stored, otherwise null.
      */
-    public boolean addMessage(Message message) {
+    public OfflineMessage addMessage(Message message) {
         if (message == null) {
             Log.trace( "Not storing null message." );
-            return false;
+            return null;
         }
         if(!shouldStoreMessage(message)) {
             Log.trace( "Not storing message, as 'should store' returned false." );
-            return false;
+            return null;
         }
         JID recipient = message.getTo();
         String username = recipient.getNode();
         // If the username is null (such as when an anonymous user), don't store.
         if (username == null || !UserManager.getInstance().isRegisteredUser(recipient, false)) {
             Log.trace( "Not storing message for which the recipient ({}) is not a registered local user.", recipient );
-            return false;
+            return null;
         }
 
         long messageID = SequenceManager.nextID(JiveConstants.OFFLINE);
@@ -196,19 +180,24 @@ public class OfflineMessageStore extends BasicModule implements UserEventListene
 
         Connection con = null;
         PreparedStatement pstmt = null;
+        OfflineMessage offlineMessage = null;
         try {
             con = DbConnectionManager.getConnection();
             pstmt = con.prepareStatement(INSERT_OFFLINE);
+
+            Date creationDate = new java.util.Date();
             pstmt.setString(1, username);
             pstmt.setLong(2, messageID);
-            pstmt.setString(3, StringUtils.dateToMillis(new java.util.Date()));
+            pstmt.setString(3, StringUtils.dateToMillis(creationDate));
             pstmt.setInt(4, msgXML.length());
             pstmt.setString(5, msgXML);
             pstmt.executeUpdate();
+
+            offlineMessage = new OfflineMessage(creationDate, message.getElement());
         }
         catch (Exception e) {
             Log.error(LocaleUtils.getLocalizedString("admin.error"), e);
-            return false;
+            return null;
         }
         finally {
             DbConnectionManager.closeConnection(pstmt, con);
@@ -220,7 +209,7 @@ public class OfflineMessageStore extends BasicModule implements UserEventListene
             size += msgXML.length();
             sizeCache.put(username, size);
         }
-        return true;
+        return offlineMessage;
     }
 
     /**
@@ -234,13 +223,10 @@ public class OfflineMessageStore extends BasicModule implements UserEventListene
      */
     public Collection<OfflineMessage> getMessages(String username, boolean delete) {
         List<OfflineMessage> messages = new ArrayList<>();
-        SAXReader xmlReader = null;
         Connection con = null;
         PreparedStatement pstmt = null;
         ResultSet rs = null;
         try {
-            // Get a sax reader from the pool
-            xmlReader = xmlReaders.take();
             con = DbConnectionManager.getConnection();
             pstmt = con.prepareStatement(LOAD_OFFLINE);
             pstmt.setString(1, username);
@@ -250,21 +236,28 @@ public class OfflineMessageStore extends BasicModule implements UserEventListene
                 Date creationDate = new Date(Long.parseLong(rs.getString(2).trim()));
                 OfflineMessage message;
                 try {
-                    message = new OfflineMessage(creationDate,
-                            xmlReader.read(new StringReader(msgXML)).getRootElement());
-                } catch (DocumentException e) {
+                    message = new OfflineMessage(creationDate, SAXReaderUtil.readRootElement(msgXML));
+                } catch (ExecutionException e) {
                     // Try again after removing invalid XML chars (e.g. &#12;)
                     Matcher matcher = pattern.matcher(msgXML);
                     if (matcher.find()) {
                         msgXML = matcher.replaceAll("");
                     }
                     try {
-                        message = new OfflineMessage(creationDate,
-                            xmlReader.read(new StringReader(msgXML)).getRootElement());
-                    } catch (DocumentException de) {
+                        message = new OfflineMessage(creationDate, SAXReaderUtil.readRootElement(msgXML));
+                    } catch (ExecutionException de) {
                         Log.error("Failed to route packet (offline message): " + msgXML, de);
                         continue; // skip and process remaining offline messages
+                    } catch (InterruptedException de) {
+                        Thread.currentThread().interrupt();
+                        Log.error("Offline Message retrieval interrupted", de);
+                        break; // Skip all further offline messages
                     }
+                }
+                catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    Log.error("Offline Message retrieval interrupted", e);
+                    break; // Skip all further offline messages
                 }
 
                 // if there is already a delay stamp, we shouldn't add another.
@@ -300,10 +293,6 @@ public class OfflineMessageStore extends BasicModule implements UserEventListene
         }
         finally {
             DbConnectionManager.closeConnection(rs, pstmt, con);
-            // Return the sax reader to the pool
-            if (xmlReader != null) {
-                xmlReaders.add(xmlReader);
-            }
         }
         return messages;
     }
@@ -321,10 +310,7 @@ public class OfflineMessageStore extends BasicModule implements UserEventListene
         Connection con = null;
         PreparedStatement pstmt = null;
         ResultSet rs = null;
-        SAXReader xmlReader = null;
         try {
-            // Get a sax reader from the pool
-            xmlReader = xmlReaders.take();
             con = DbConnectionManager.getConnection();
             pstmt = con.prepareStatement(LOAD_OFFLINE_MESSAGE);
             pstmt.setString(1, username);
@@ -332,8 +318,7 @@ public class OfflineMessageStore extends BasicModule implements UserEventListene
             rs = pstmt.executeQuery();
             while (rs.next()) {
                 String msgXML = rs.getString(1);
-                message = new OfflineMessage(creationDate,
-                        xmlReader.read(new StringReader(msgXML)).getRootElement());
+                message = new OfflineMessage(creationDate, SAXReaderUtil.readRootElement(msgXML));
                 // Add a delayed delivery (XEP-0203) element to the message.
                 Element delay = message.addChildElement("delay", "urn:xmpp:delay");
                 delay.addAttribute("from", XMPPServer.getInstance().getServerInfo().getXMPPDomain());
@@ -343,12 +328,11 @@ public class OfflineMessageStore extends BasicModule implements UserEventListene
         catch (Exception e) {
             Log.error("Error retrieving offline messages of username: " + username +
                     " creationDate: " + creationDate, e);
+            if (e instanceof InterruptedException) {
+                Thread.currentThread().interrupt();
+            }
         }
         finally {
-            // Return the sax reader to the pool
-            if (xmlReader != null) {
-                xmlReaders.add(xmlReader);
-            }
             DbConnectionManager.closeConnection(rs, pstmt, con);
         }
         return message;
@@ -528,12 +512,7 @@ public class OfflineMessageStore extends BasicModule implements UserEventListene
     @Override
     public void start() throws IllegalStateException {
         super.start();
-        // Initialize the pool of sax readers
-        for (int i=0; i<POOL_SIZE; i++) {
-            SAXReader xmlReader = new SAXReader();
-            xmlReader.setEncoding("UTF-8");
-            xmlReaders.add(xmlReader);
-        }
+
         // Add this module as a user event listener so we can delete
         // all offline messages when a user is deleted
         UserEventDispatcher.addListener(this);
@@ -547,8 +526,6 @@ public class OfflineMessageStore extends BasicModule implements UserEventListene
     @Override
     public void stop() {
         super.stop();
-        // Clean up the pool of sax readers
-        xmlReaders.clear();
         // Remove this module as a user event listener
         UserEventDispatcher.removeListener(this);
         //stop timer if started
@@ -564,6 +541,11 @@ public class OfflineMessageStore extends BasicModule implements UserEventListene
     static boolean shouldStoreMessage(final Message message) {
         // XEP-0334: Implement the <no-store/> hint to override offline storage
         if (message.getChildElement("no-store", "urn:xmpp:hints") != null) {
+            return false;
+        }
+
+        // OF-2083: Prevent storing offline message that is already stored
+        if (message.getChildElement("offline", "http://jabber.org/protocol/offline") != null) {
             return false;
         }
 

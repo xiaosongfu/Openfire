@@ -19,17 +19,15 @@ package org.jivesoftware.openfire.muc;
 import org.dom4j.Attribute;
 import org.dom4j.Element;
 import org.dom4j.Namespace;
-import org.dom4j.io.SAXReader;
 import org.jivesoftware.openfire.user.UserNotFoundException;
+import org.jivesoftware.util.SAXReaderUtil;
 import org.jivesoftware.util.XMPPDateTimeFormat;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.xml.sax.SAXException;
 import org.xmpp.packet.JID;
 import org.xmpp.packet.Message;
 
 import javax.annotation.Nullable;
-import java.io.StringReader;
 import java.util.Date;
 import java.util.Iterator;
 import java.util.List;
@@ -161,8 +159,7 @@ public final class MUCRoomHistory {
         if (stanza != null) {
             // payload initialized as XML string from DB
             try {
-                SAXReader xmlReader = setupSAXReader();
-                Element element = xmlReader.read(new StringReader(stanza)).getRootElement();
+                Element element = SAXReaderUtil.readRootElement(stanza);
                 for (Element child : (List<Element>)element.elements()) {
                     Namespace ns = child.getNamespace();
                     if (ns == null || ns.getURI().equals("jabber:client") || ns.getURI().equals("jabber:server")) {
@@ -184,6 +181,9 @@ public final class MUCRoomHistory {
                 }
             } catch (Exception ex) {
                 Log.error("Failed to parse payload XML", ex);
+                if (ex instanceof InterruptedException) {
+                    Thread.currentThread().interrupt();
+                }
             }
         }
         message.setSubject(subject);
@@ -211,15 +211,6 @@ public final class MUCRoomHistory {
             delayInformation.addAttribute("from", room.getRole().getRoleAddress().toString());
         }
         historyStrategy.addMessage(message);
-    }
-
-    private SAXReader setupSAXReader() throws SAXException {
-        SAXReader xmlReader = new SAXReader();
-        xmlReader.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true);
-        xmlReader.setFeature("http://xml.org/sax/features/external-general-entities", false);
-        xmlReader.setFeature("http://xml.org/sax/features/external-parameter-entities", false);
-        xmlReader.setEncoding("UTF-8");
-        return xmlReader;
     }
 
     /**
